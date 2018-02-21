@@ -14,6 +14,7 @@ import argparse
 import base64
 import errno
 import hashlib
+import json
 import os
 import plistlib
 import re
@@ -69,7 +70,7 @@ def decrypt_chunk(data, chunk_encryption_key, chunk_checksum):
     print "chunk decryption Failed"
     return None
 
-def plist_request(host, method, url, body, headers):
+def plist_request(host, method, url, body, headers, log = None):
     conn = HTTPSConnection(host)
     sock = socket.create_connection((conn.host, conn.port), conn.timeout, conn.source_address)
     conn.sock = ssl.wrap_socket(sock, conn.key_file, conn.cert_file, ssl_version=ssl.PROTOCOL_TLSv1)
@@ -88,11 +89,20 @@ def plist_request(host, method, url, body, headers):
         else:
             print "{}: {}".format(plist_data.title, plist_data.message)
 
+        if log:
+            log.write("plist request with host {}, method {}, url {}, body {}:\n".format(host, method, url, body))
+            log.write(" headers were {}\n".format(headers))
+            log.write(" response status was {}\n".format(response.status))
         return
 
+    if log:
+        log.write("plist request with host {}, method {}, url {}, body {}:\n".format(host, method, url, body))
+        log.write(" headers were {}\n".format(headers))
+        log.write(" response:\n")
+        log.write("{}\n".format(json.dumps(plist_data, indent=4)))
     return plist_data
 
-def probobuf_request(host, method, url, body, headers, msg=None):
+def probobuf_request(host, method, url, body, headers, msg=None, log=None):
     conn = HTTPSConnection(host)
     sock = socket.create_connection((conn.host, conn.port), conn.timeout, conn.source_address)
     conn.sock = ssl.wrap_socket(sock, conn.key_file, conn.cert_file, ssl_version=ssl.PROTOCOL_TLSv1)
@@ -113,10 +123,18 @@ def probobuf_request(host, method, url, body, headers, msg=None):
 
     conn.close()
     if msg == None:
+        if log:
+            log.write("probobuf request with host {}, method {}, url {}, body {}:\n".format(host, method, url, body))
+            log.write(" headers were {}\n".format(headers))
+            log.write(" response was {}\n".format(data))
         return data
 
     res = msg()
     res.ParseFromString(data)
+    if log:
+        log.write("probobuf request with host {}, method {}, url {}, body {}:\n".format(host, method, url, body))
+        log.write(" headers were {}\n".format(headers))
+        log.write(" response was {}\n".format(repr(res)))
     return res
 
 
@@ -157,7 +175,7 @@ def host_from_url(url):
     return urlparse.urlparse(url).hostname
 
 class MobileBackupClient(object):
-    def __init__(self, account_settings, dsPrsID, auth, output_folder):
+    def __init__(self, account_settings, dsPrsID, auth, output_folder, log = None):
         mobilebackup_url = account_settings["com.apple.mobileme"]["com.apple.Dataclass.Backup"]["url"]
         content_url = account_settings["com.apple.mobileme"]["com.apple.Dataclass.Content"]["url"]
 
@@ -182,6 +200,7 @@ class MobileBackupClient(object):
 
         self.files = {}
         self.output_folder = output_folder
+        self.log = log
 
         self.chosen_snapshot_id = None
         self.combined = False
@@ -191,7 +210,7 @@ class MobileBackupClient(object):
         self.threads = DEFAULT_THREADS
 
     def mobile_backup_request(self, method, url, msg=None, body=""):
-        return probobuf_request(self.mobilebackup_host, method, url, body, self.headers, msg)
+        return probobuf_request(self.mobilebackup_host, method, url, body, self.headers, msg, self.log)
 
     def get_account(self):
         return self.mobile_backup_request("GET", MBS[self.dsPrsID](), MBSAccount)
@@ -584,12 +603,14 @@ class MobileBackupClient(object):
         mbdb_file.close()
 
 
-def download_backup(login, password, output_folder, types, chosen_snapshot_id, combined, itunes_style, domain, threads, keep_existing):
+def download_backup(login, password, output_folder, types, chosen_snapshot_id, combined, itunes_style, domain, threads, keep_existing, log):
     print 'Working with %s : %s' % (login, password)
     print 'Output directory :', output_folder
+    logfile = open(log, "w")
 
+    logfile.write("About to do basic authentication\n")
     auth = "Basic %s" % base64.b64encode("%s:%s" % (login, password))
-    authenticateResponse = plist_request("setup.icloud.com", "POST", "/setup/authenticate/$APPLE_ID$", "", {"Authorization": auth})
+    authenticateResponse = plist_request("setup.icloud.com", "POST", "/setup/authenticate/$APPLE_ID$", "", {"Authorization": auth}, logfile)
     if not authenticateResponse:
         # There was an error authenticating the user.
         return
@@ -602,9 +623,10 @@ def download_backup(login, password, output_folder, types, chosen_snapshot_id, c
         'X-MMe-Client-Info': CLIENT_INFO,
         'User-Agent': USER_AGENT_UBD
     }
-    account_settings = plist_request("setup.icloud.com", "POST", "/setup/get_account_settings", "", headers)
+    logfile.write("\nAbout to look up settings\n")
+    account_settings = plist_request("setup.icloud.com", "POST", "/setup/get_account_settings", "", headers, logfile)
     auth = "X-MobileMe-AuthToken %s" % base64.b64encode("%s:%s" % (dsPrsID, authenticateResponse["tokens"]["mmeAuthToken"]))
-    client = MobileBackupClient(account_settings, dsPrsID, auth, output_folder)
+    client = MobileBackupClient(account_settings, dsPrsID, auth, output_folder, logfile)
 
     client.chosen_snapshot_id = chosen_snapshot_id
     client.combined = combined
@@ -650,6 +672,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", type=str, default="output",
             help="Output Directory")
 
+    parser.add_argument("--log", "-l", type=str, default="log", help="Log file")
+    
     parser.add_argument("--combined", action="store_true",
             help="Do not separate each snapshot into its own folder")
 
@@ -676,5 +700,5 @@ if __name__ == "__main__":
                     "and that has the same file size locally as in the backup.")
 
     args = parser.parse_args()
-    download_backup(args.apple_id, args.password, args.output, args.item_types, args.snapshot, args.combined, args.itunes_style, args.domain, args.threads, args.keep_existing)
+    download_backup(args.apple_id, args.password, args.output, args.item_types, args.snapshot, args.combined, args.itunes_style, args.domain, args.threads, args.keep_existing, args.log)
 
